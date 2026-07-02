@@ -48,6 +48,7 @@
   .pg.k-text{outline:2px solid var(--okLine)}
   .pg.k-scan .lb,.pg.k-unknown .lb{color:var(--amber)}
   .pg .ocr{font-size:10px;color:#fff;background:var(--amber);border-radius:3px;padding:0 4px;margin-left:4px}
+  .pg .mem{font-size:10px;color:#fff;background:var(--ok);border-radius:3px;padding:0 4px;margin-left:4px}
   .err{color:#b23b3b;font-size:13px;margin-top:10px}
   .foot{margin-top:40px;font-size:11.5px;color:#9aa4af;border-top:1px solid var(--line);padding-top:10px}
   h3{font-size:14px;letter-spacing:.5px;margin:22px 0 8px}
@@ -64,10 +65,14 @@
       <div class="s">整份月報或單張報表皆可</div>
       <input id="file" type="file" accept="application/pdf" hidden>
     </label>
-    <label class="ck"><input type="checkbox" id="ocr"> 開啟 OCR 辨識掃描頁</label>
+    <label class="ck"><input type="checkbox" id="ocr" checked> 開啟 OCR 辨識掃描頁</label>
     <button class="act" id="go" disabled>開始辨識</button>
     <span class="ocrTag" id="ocrTag"></span>
   </div>
+  <div id="ocrHint" style="display:none;margin-top:8px;font-size:12.5px;color:var(--amber);background:var(--amberSoft);border:1px solid var(--amberLine);border-radius:6px;padding:8px 11px">
+    ⏳ 已開啟 OCR：會逐頁辨識掃描頁，整份月報（約 40–50 頁）通常需 <b>數十秒</b>，請按下後耐心等候，勿關閉或重整頁面。
+  </div>
+  <div id="status" style="display:none;margin-top:10px;font-size:13px;color:var(--accent);background:var(--accentSoft);border-radius:6px;padding:9px 12px"></div>
   <div class="err" id="err"></div>
 
   <div id="out" style="display:none">
@@ -82,24 +87,46 @@
     <div class="sec" id="sections"></div>
 
     <h3>逐頁檢視與校正（下拉可改判各頁屬於哪張表）</h3>
-    <div style="margin-bottom:8px"><button class="act" id="recalc">依校正重新整理段落</button></div>
+    <div style="margin-bottom:8px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button class="act" id="recalc">依校正重新整理段落</button>
+      <span style="font-size:12.5px;color:var(--soft)">改對下拉即自動記住此表頭，下次自動套用。</span>
+      <span id="memStat" style="font-size:12.5px;color:var(--ok);margin-left:auto"></span>
+    </div>
     <div class="grid" id="grid"></div>
+
+    <h3>產生編碼＋目次</h3>
+    <div class="panel" style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px">
+        <div><label style="font-size:12px;color:var(--soft)">機關碼</label><input id="bOrg" value="314" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:5px"></div>
+        <div style="grid-column:span 2"><label style="font-size:12px;color:var(--soft)">校名</label><input id="bSchool" value="高雄市立七賢國民中學" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:5px"></div>
+        <div><label style="font-size:12px;color:var(--soft)">民國年</label><input id="bYear" value="115" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:5px"></div>
+        <div><label style="font-size:12px;color:var(--soft)">月份</label><input id="bMonth" value="6" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:5px"></div>
+      </div>
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:12.5px;color:var(--soft)">
+        <label style="display:flex;gap:5px;align-items:center"><input type="checkbox" id="bStamp" checked> 蓋頁碼（第10項起，底部置中）</label>
+        <label style="display:flex;gap:5px;align-items:center"><input type="checkbox" id="bToc" checked> 生成目次</label>
+      </div>
+      <button class="act" id="btnBuild">產生並下載 PDF</button>
+      <span id="buildStatus" style="margin-left:12px;font-size:12.5px;color:var(--accent)"></span>
+    </div>
   </div>
 
-  <div class="foot">辨識服務 v0.1 · 抽字為主、OCR 為輔（需主機已安裝 Tesseract 正體中文）。編碼與目次生成於辨識確認後接續。</div>
+  <div class="foot">辨識服務 v0.2 · 抽字為主、OCR 為輔（需主機已安裝 Tesseract 正體中文）＋校正記憶（存於 /data）。編碼＝第10項起底部置中；目次依實際存在的表自動生成。</div>
 </div>
 
 <script>
 const NAMES = {
   i1:"基金來源、用途及餘絀表", i2:"主要業務計畫執行明細表", i3:"資本資產明細表",
+  ltdebt:"長期負債明細表",
   i4:"固定資產建設改良擴充執行情形明細表", i5:"平衡表", i6:"收入支出表",
   i7:"預算執行與會計收支對照表", i8:"各項費用彙計表", i9:"平衡表科目明細表",
   i10:"銀行存款差額解釋表", bank:"對帳單", i11:"保管(證)品月報", i12:"保管品對帳單",
   i13:"市有財產增減結存表", i14:"財產折舊月報表", i15:"財產增減月報表", i16:"電腦軟體增減結存表",
-  i17:"市有財產增減結存表(半年報)", i18:"財產增減表(半年報)",
+  lease1:"租賃資產增減報表", lease2:"租賃資產增減結存表", lease3:"租賃資產折舊月報表",
+  i17:"市有財產增減結存表(半年報)", i18:"財產增減表(半年報)", yr:"市有財產增減結存表(年報)",
   i19:"原始憑證留存代辦、受委託機關（構）、學校或民間團體明細表"
 };
-const ORDER=["i1","i2","i3","i4","i5","i6","i7","i8","i9","i10","bank","i11","i12","i13","i14","i15","i16","i17","i18","i19"];
+const ORDER=["i1","i2","i3","ltdebt","i4","i5","i6","i7","i8","i9","i10","bank","i11","i12","i13","i14","i15","i16","lease1","lease2","lease3","i17","i18","yr","i19"];
 let pagesData=[];
 
 const dz=document.getElementById("dz"), fileInput=document.getElementById("file");
@@ -116,21 +143,45 @@ function setFile(f){ if(!f)return; chosen=f;
 
 fetch("/api/health").then(r=>r.json()).then(h=>{
   document.getElementById("ocrTag").textContent = h.ocr_available ? "（主機 OCR 可用）" : "（主機未安裝 OCR，開啟無效）";
+  if(h.memory && typeof h.memory.entries==="number") setMemCount(h.memory.entries);
+  const ms=document.getElementById("memStat");
+  if(ms && !h.storage_ok) ms.textContent="（記憶儲存未就緒：請確認已掛載 /data 硬碟）";
 }).catch(()=>{});
 
 document.getElementById("go").addEventListener("click", recognize);
+// 勾選 OCR 時即時顯示等候提醒
+document.getElementById("ocr").addEventListener("change",updateOcrHint);
+updateOcrHint();  // 初始化：OCR 預設勾選，提示隨之顯示
+function updateOcrHint(){
+  const on=document.getElementById("ocr").checked;
+  document.getElementById("ocrHint").style.display = on ? "block" : "none";
+}
 async function recognize(){
   if(!chosen)return;
-  const go=document.getElementById("go"); go.disabled=true; go.textContent="辨識中…";
+  const go=document.getElementById("go");
+  const ocrOn=document.getElementById("ocr").checked;
+  go.disabled=true;
+  go.textContent = ocrOn ? "辨識中（含 OCR，較久）…" : "辨識中…";
   document.getElementById("err").textContent="";
+  // 進行中狀態列
+  const st=document.getElementById("status");
+  st.style.display="block";
+  st.textContent = ocrOn
+    ? "正在辨識，並逐頁 OCR 掃描頁，整份檔可能需數十秒，請耐心等候，勿關閉或重整頁面…"
+    : "正在辨識中…";
+  let dots=0;
+  const base=st.textContent.replace(/…*$/,"");
+  const timer=setInterval(()=>{ dots=(dots+1)%4; st.textContent=base+"．".repeat(dots); },500);
   const fd=new FormData();
-  fd.append("file",chosen); fd.append("ocr",document.getElementById("ocr").checked); fd.append("thumbnails","true");
+  fd.append("file",chosen); fd.append("ocr",ocrOn); fd.append("thumbnails","true");
   try{
     const r=await fetch("/api/recognize",{method:"POST",body:fd});
     const data=await r.json();
     if(data.error){ document.getElementById("err").textContent=data.error; }
     else render(data);
   }catch(e){ document.getElementById("err").textContent="連線或處理失敗："+e.message; }
+  clearInterval(timer);
+  st.style.display="none";
   go.disabled=false; go.textContent="開始辨識";
 }
 
@@ -162,12 +213,14 @@ function renderGrid(){
   const grid=document.getElementById("grid"); grid.innerHTML="";
   pagesData.forEach((p,idx)=>{
     const cell=document.createElement("div"); cell.className="pg k-"+p.kind;
-    const opts=['<option value="">— 未指定 —</option>','<option value="front">前置(封面/檢核/目次)</option>']
+    const isFront = p.kind==="front";
+    const opts=[`<option value="" ${(!p.key&&!isFront)?"selected":""}>— 未指定 —</option>`,
+                `<option value="front" ${isFront?"selected":""}>前置(封面/檢核/目次)</option>`]
       .concat(ORDER.map(k=>`<option value="${k}" ${p.key===k?"selected":""}>${NAMES[k]}</option>`)).join("");
     cell.innerHTML=`
       ${p.thumb?`<img src="${p.thumb}" alt="第${p.page}頁">`:""}
       <div class="cap">
-        <div class="no">第 ${p.page} 頁${p.ocr?'<span class="ocr">OCR</span>':''}</div>
+        <div class="no">第 ${p.page} 頁${p.ocr?'<span class="ocr">OCR</span>':''}${p.mem?'<span class="mem">記憶</span>':''}</div>
         <div class="lb">${p.label||""}</div>
         <select data-idx="${idx}">${opts}</select>
       </div>`;
@@ -178,10 +231,58 @@ function renderGrid(){
     pagesData[i].key = v && v!=="front" ? v : null;
     pagesData[i].kind = v==="front" ? "front" : (v ? "text" : "scan");
     pagesData[i].label = v==="front" ? "前置" : (v ? NAMES[v] : "（待指定）");
+    // 送出校正記憶：選到某張表→記住；選「未指定」→清除；「前置」不記
+    const fp = pagesData[i].fp;
+    if(fp){
+      if(v && v!=="front"){
+        postRemember({fp, key:v, sample:pagesData[i].header||""});
+      }else if(v===""){
+        postRemember({fp, key:"__clear__"});
+      }
+    }
   }));
 }
-document.getElementById("recalc").addEventListener("click",()=>{
-  // 依逐頁 key 於前端重建段落
+async function postRemember(body){
+  try{
+    const r=await fetch("/api/remember",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j&&j.memory&&typeof j.memory.entries==="number") setMemCount(j.memory.entries);
+  }catch(e){/* 記憶失敗不影響操作 */}
+}
+function setMemCount(n){
+  const el=document.getElementById("memStat");
+  if(el) el.textContent = n>0 ? `已學習 ${n} 筆表頭` : "";
+}
+document.getElementById("btnBuild").addEventListener("click", buildPdf);
+async function buildPdf(){
+  if(!chosen){ return; }
+  const btn=document.getElementById("btnBuild"), st=document.getElementById("buildStatus");
+  btn.disabled=true; st.textContent="產生中，請稍候…";
+  const fd=new FormData();
+  fd.append("file", chosen);
+  fd.append("org", document.getElementById("bOrg").value.trim()||"314");
+  fd.append("roc_year", document.getElementById("bYear").value.trim()||"115");
+  fd.append("month", document.getElementById("bMonth").value.trim()||"6");
+  fd.append("school", document.getElementById("bSchool").value.trim());
+  fd.append("stamp", document.getElementById("bStamp").checked);
+  fd.append("add_toc", document.getElementById("bToc").checked);
+  // 帶入使用者校正後的逐頁判定，讓成品以校正為準
+  const pk = pagesData.map(p=>({page:p.page, kind:p.kind, key:p.key}));
+  fd.append("page_keys", JSON.stringify(pk));
+  try{
+    const r=await fetch("/api/build",{method:"POST",body:fd});
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.error||("HTTP "+r.status)); }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download=`${document.getElementById("bYear").value}年${document.getElementById("bMonth").value}月_會計月報.pdf`;
+    a.click(); setTimeout(()=>URL.revokeObjectURL(url),1500);
+    st.textContent="已產生並下載。";
+  }catch(e){ st.textContent="產生失敗："+e.message; }
+  btn.disabled=false;
+}
+document.getElementById("recalc").addEventListener("click",()=>{  // 依逐頁 key 於前端重建段落
   const sections=[]; let cur=null;
   const close=()=>{ if(cur){sections.push(cur);cur=null;} };
   pagesData.forEach(p=>{

@@ -8,6 +8,7 @@
 import re
 import base64
 import fitz  # PyMuPDF
+import memory
 
 # ---------- 目次順序與各表比對規則 ----------
 ORDER = ["i1", "i2", "i3", "ltdebt", "i4", "i5", "i6", "i7", "i8", "i9", "i10",
@@ -45,7 +46,7 @@ EXC = {"i5": ["科目明細"], "bank": ["保管品"], "i11": ["對帳單"], "i13
 REQUIRE = {"i17": ["半年"], "i18": ["半年"], "yr": ["年報"]}
 
 # UTR 程式代號錨點（OCR 對代號較穩，可當強錨；月報/半年報同代號者靠順序約束區分）
-UTR = {"i14": "UTR270"}  # 僅保留唯一對應代號當強錨；共用代號(UTR022/UTR011)不設錨，改靠標題，讀不清則留待確認
+UTR = {"i13": "022", "i14": "270", "i15": "011", "i17": "022", "i18": "011", "yr": "022"}  # 取3碼數字，容忍OCR把UTR誤讀
 
 # 掃描表慣用頁數（供前端預填掃描段邊界；使用者可改）
 DEFAULT_PAGES = {k: 1 for k in ORDER}
@@ -105,24 +106,28 @@ def _match_key(text, allowed, fuzzy=False):
     cands = []
     for k in allowed:
         best = 0
+        pos = 10 ** 9                          # 該表關鍵字/代號在文中最早出現位置
         for kw in INC[k]:
             w = _norm(kw)
             if w in n:
-                best = max(best, len(w))
+                best = max(best, len(w)); pos = min(pos, n.find(w))
             elif fuzzy and len(w) >= 6 and _lcs_ratio(w, n) >= 0.8:
                 best = max(best, len(w) - 1)   # 容錯命中略降權，完全相符優先
-        if fuzzy and k in UTR and UTR[k] in n:
-            best = max(best, 4)                # UTR 弱錨，月報/半年報靠順序約束區分
+        if fuzzy and k in UTR:
+            mm = re.search(r"U[TIL1J]R\s*0*" + UTR[k], n)
+            if mm:
+                best = max(best, 20); pos = min(pos, mm.start())   # UTR 代號為強錨
         if best > 0 and not any(_norm(e) in n for e in EXC.get(k, [])) \
                 and all(_norm(rq) in n for rq in REQUIRE.get(k, [])):
-            cands.append((best, k))
+            cands.append((best, -pos, k))       # 權重高、位置前者優先
     if not cands:
         return None
     cands.sort(reverse=True)
-    top = cands[0][0]
-    if sum(1 for c in cands if c[0] == top) > 1:
-        return None  # 並列衝突，不猜
-    return cands[0][1]
+    top = cands[0][:2]
+    # 僅在權重與位置都相同時才視為真衝突、不猜
+    if sum(1 for c in cands if c[:2] == top) > 1:
+        return None
+    return cands[0][2]
 
 
 # ---------- OCR（可插拔） ----------
@@ -140,6 +145,14 @@ def _ocr_page(page):
         import pytesseract
         from PIL import Image
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        # 以影像位元組雜湊做快取鍵：同一頁重跑不再 OCR
+        try:
+            h = memory.page_hash(pix.tobytes("png"))
+            cached = memory.cache_get_ocr(h)
+            if cached is not None:
+                return cached
+        except Exception:
+            h = None
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         # 先用 OSD 偵測方向並轉正（處理側躺/倒置的掃描頁）
         try:
@@ -150,7 +163,13 @@ def _ocr_page(page):
                 img = img.rotate(-deg, expand=True)
         except Exception:
             pass
-        return pytesseract.image_to_string(img, lang="chi_tra") or ""
+        text = pytesseract.image_to_string(img, lang="chi_tra") or ""
+        if h:
+            try:
+                memory.cache_put_ocr(h, text)
+            except Exception:
+                pass
+        return text
     except Exception:
         return ""
 
@@ -194,6 +213,8 @@ def analyze(pdf_bytes, use_ocr=False, want_thumbs=True):
         header = re.sub(r"\s+", " ", raw).strip()[:60]
         kind, key, label = None, None, None
         ocr_used_here = False
+        mem_hit = False
+        fp_text = raw            # 供指紋/記憶的文字來源（掃描頁改用 OCR 文字）
 
         front = _is_front(raw)
         in_front_zone = (first_body is not None) and (i < front_zone_end)
@@ -202,17 +223,28 @@ def analyze(pdf_bytes, use_ocr=False, want_thumbs=True):
             kind, label = "front", (front or "封面／前置")
         else:
             key = _match_key(raw, ORDER[ptr:])
+            # 抽字命中不到 → 先查記憶庫（便宜，掃描前先試）
+            if key is None and len(n) >= 6:
+                mk = memory.lookup(raw)
+                if mk and mk in ORDER[ptr:]:
+                    key, mem_hit = mk, True
+            # 仍無 → OCR，OCR 文字再比對＋查記憶
             if key is None and use_ocr and len(n) < 15:
                 otext = _ocr_page(page)
                 if _norm(otext):
                     ocr_used_here = True
-                    # 防呆：OCR 文字若同時命中 3 張以上不同表(像檢核表/目次會列出所有表名)，視為列表頁不採用
+                    fp_text = otext
                     distinct = _distinct_matches(otext, ORDER[ptr:])
                     if len(distinct) < 3:
                         k2 = _match_key(otext, ORDER[ptr:], fuzzy=True)
                         if k2:
                             key = k2
                             header = re.sub(r"\s+", " ", otext).strip()[:60]
+                        else:
+                            mk = memory.lookup(otext)
+                            if mk and mk in ORDER[ptr:]:
+                                key, mem_hit = mk, True
+                                header = re.sub(r"\s+", " ", otext).strip()[:60]
             if key:
                 ptr = ORDER.index(key)
                 kind, label = "text", NAME[key]
@@ -222,7 +254,8 @@ def analyze(pdf_bytes, use_ocr=False, want_thumbs=True):
                 kind, label = "unknown", "有文字但未對應任何表"
 
         p = {"page": i + 1, "kind": kind, "key": key, "label": label,
-             "header": header, "text_len": len(n), "ocr": ocr_used_here}
+             "header": header, "text_len": len(n), "ocr": ocr_used_here,
+             "mem": mem_hit, "fp": memory.fingerprint(fp_text)}
         if want_thumbs:
             p["thumb"] = _thumb(page)
         pages.append(p)
