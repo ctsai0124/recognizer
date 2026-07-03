@@ -6,6 +6,7 @@
 - 重組輸出最終 PDF（封面/檢核表保留、舊目次丟棄、目次重生）
 """
 import fitz
+import io
 import recognizer as R
 
 # 目次階層（含條件式表；只有實際存在的表才會列出）
@@ -26,6 +27,55 @@ CN = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
       "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十"]
 
 CODE_START_KEY = "i10"   # 工具自第 10 項起蓋碼（1~9 由系統直出、已有碼）
+
+
+def _file_sort_key(pages):
+    """決定一個檔在合併順序中的位置：前置最前、其餘依其主要表的目次順序。"""
+    order_pos = {k: i for i, k in enumerate(R.ORDER)}
+    keys = [p.get("key") for p in pages if p.get("key")]
+    fronts = sum(1 for p in pages if p["kind"] == "front")
+    if keys:
+        return min(order_pos.get(k, 998) for k in keys)
+    if fronts and fronts >= len(pages) / 2:
+        return -10                       # 封面/檢核表等前置 → 最前
+    return 997                           # 認不出的 → 靠後，交由人工
+
+
+def merge_sorted(file_list, use_ocr=True):
+    """
+    多檔合併：file_list=[(name, bytes), ...]
+    逐檔辨識其主要表，依目次順序排序後合併為單一 PDF。
+    回傳 (merged_bytes, report)。
+    """
+    items = []
+    for idx, (name, data) in enumerate(file_list):
+        try:
+            res = R.analyze(data, use_ocr=use_ocr, want_thumbs=False)
+            pages = res["pages"]
+        except Exception:
+            pages = []
+        sk = _file_sort_key(pages) if pages else 997
+        primary = None
+        for p in pages:
+            if p.get("key"):
+                primary = p["key"]; break
+        items.append({"upload_idx": idx, "name": name, "data": data,
+                      "sort": sk, "primary": primary,
+                      "primary_name": R.NAME.get(primary, "（未辨識）"),
+                      "page_count": len(pages)})
+    items.sort(key=lambda it: (it["sort"], it["upload_idx"]))
+
+    out = fitz.open()
+    for it in items:
+        src = fitz.open(stream=it["data"], filetype="pdf")
+        out.insert_pdf(src)
+        src.close()
+    merged = out.tobytes(deflate=True)
+    out.close()
+    report = [{"name": it["name"], "primary": it["primary"],
+               "primary_name": it["primary_name"], "pages": it["page_count"]}
+              for it in items]
+    return merged, report
 
 
 def _body_ranges(pages):
@@ -132,12 +182,65 @@ def _stamp(page, text, size=11):
     tw.write_text(page)
 
 
+def prep_stamp(img_bytes, thresh=235):
+    """去白底：接近白色的背景轉透明，只留印文；並裁掉透明邊。回傳 PNG bytes。"""
+    from PIL import Image
+    import numpy as np
+    im = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    arr = np.array(im)
+    r, g, b = arr[:, :, 0].astype(int), arr[:, :, 1].astype(int), arr[:, :, 2].astype(int)
+    whiteish = (r >= thresh) & (g >= thresh) & (b >= thresh)
+    arr[:, :, 3] = np.where(whiteish, 0, arr[:, :, 3])
+    im2 = Image.fromarray(arr, "RGBA")
+    bbox = im2.getbbox()
+    if bbox:
+        im2 = im2.crop(bbox)
+    out = io.BytesIO()
+    im2.save(out, "PNG")
+    return out.getvalue()
+
+
+CM = 28.3465  # 1 公分 = 28.35 pt
+
+
+def overlay_chop(page, chop_png, width_cm=3.5, margin_cm=1.0):
+    """在頁面右下角疊上章（保持比例）。"""
+    from PIL import Image
+    im = Image.open(io.BytesIO(chop_png))
+    iw, ih = im.size
+    w = width_cm * CM
+    h = w * ih / iw
+    W, H = page.rect.width, page.rect.height
+    m = margin_cm * CM
+    x1, y1 = W - m, H - m
+    rect = fitz.Rect(x1 - w, y1 - h, x1, y1)
+    page.insert_image(rect, stream=chop_png, overlay=True, keep_proportion=True)
+
+
+def stamp_preview(pdf_bytes, chop_bytes, use_ocr=True, width_cm=3.5, margin_cm=1.0):
+    """回傳一張「蓋好章的對帳單頁」預覽 PNG bytes（找第一頁 bank）。無對帳單則回 None。"""
+    res = R.analyze(pdf_bytes, use_ocr=use_ocr, want_thumbs=False)
+    bank_page = next((p["page"] for p in res["pages"] if p.get("key") == "bank"), None)
+    if bank_page is None:
+        return None
+    chop = prep_stamp(chop_bytes)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[bank_page - 1]
+    overlay_chop(page, chop, width_cm, margin_cm)
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4))
+    out = pix.tobytes("png")
+    doc.close()
+    return out
+
+
 def build_final(pdf_bytes, org="314", roc_year="115", month="6",
                 school="高雄市立七賢國民中學", use_ocr=True,
                 code_from=CODE_START_KEY, stamp=True, add_toc=True,
-                pages_override=None):
+                pages_override=None, chop_bytes=None,
+                chop_width_cm=3.5, chop_margin_cm=1.0):
     """回傳 (最終PDF bytes, 摘要dict)。
-    pages_override: 若提供(使用者校正後的逐頁 [{page,kind,key}...])，則以其為準，不再自動辨識。"""
+    pages_override: 若提供(使用者校正後的逐頁)，則以其為準，不再自動辨識。
+    chop_bytes: 若提供，於所有「對帳單」頁右下角蓋章(自動去白底)。"""
     if pages_override:
         pages = pages_override
     else:
@@ -146,10 +249,11 @@ def build_final(pdf_bytes, org="314", roc_year="115", month="6",
     ranges, body_idx, front_count = _body_ranges(pages)
 
     order_pos = {k: i for i, k in enumerate(R.ORDER)}
-    from_pos = order_pos.get(code_from, 0)
     stamp_start_idx = None
     if code_from in ranges:
         stamp_start_idx = ranges[code_from][0]
+
+    chop_png = prep_stamp(chop_bytes) if chop_bytes else None
 
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = fitz.open()
@@ -168,13 +272,17 @@ def build_final(pdf_bytes, org="314", roc_year="115", month="6",
         out.insert_pdf(toc)
         toc.close()
 
-    # 3) 正文（保留原頁），第 code_from 項起蓋碼
+    # 3) 正文（保留原頁），第 code_from 項起蓋碼；對帳單頁右下角蓋章
+    bank_stamped = 0
     body_pages = [p for p in pages if p["kind"] != "front"]
     for p in body_pages:
         out.insert_pdf(src, from_page=p["page"] - 1, to_page=p["page"] - 1)
         idx = body_idx[p["page"]]
         if stamp and stamp_start_idx is not None and idx >= stamp_start_idx:
             _stamp(out[-1], "%s-%d" % (org, idx))
+        if chop_png and p.get("key") == "bank":
+            overlay_chop(out[-1], chop_png, chop_width_cm, chop_margin_cm)
+            bank_stamped += 1
 
     data = out.tobytes(deflate=True)
     summary = {
@@ -182,6 +290,7 @@ def build_final(pdf_bytes, org="314", roc_year="115", month="6",
         "front_count": front_count,
         "stamp_start_index": stamp_start_idx,
         "toc_entries": len(_toc_entries(ranges)),
+        "bank_pages_stamped": bank_stamped,
     }
     out.close(); src.close()
     return data, summary

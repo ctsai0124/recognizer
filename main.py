@@ -28,18 +28,28 @@ def health():
 
 @app.post("/api/recognize")
 async def recognize(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     ocr: bool = Form(False),
     thumbnails: bool = Form(True),
 ):
-    """輸入一份 PDF，回傳逐頁判定與整併段落。ocr=true 時對抽不到字的頁嘗試 OCR。"""
-    if not file.filename.lower().endswith(".pdf"):
-        return JSONResponse({"error": "請上傳 PDF 檔"}, status_code=400)
-    data = await file.read()
+    """輸入一或多份 PDF。多份時先依目次順序自動合併，再逐頁辨識。"""
+    blobs = []
+    for f in files:
+        if not f.filename.lower().endswith(".pdf"):
+            return JSONResponse({"error": "請上傳 PDF 檔：" + f.filename}, status_code=400)
+        blobs.append((f.filename, await f.read()))
+    merge_report = None
+    if len(blobs) == 1:
+        data = blobs[0][1]
+    else:
+        data, merge_report = builder.merge_sorted(blobs, use_ocr=ocr)
     try:
         result = recognizer.analyze(data, use_ocr=ocr, want_thumbs=thumbnails)
     except Exception as e:  # noqa
         return JSONResponse({"error": "辨識失敗：{}".format(e)}, status_code=400)
+    if merge_report is not None:
+        result["merge_report"] = merge_report
+        result["merged"] = True
     return result
 
 
@@ -57,9 +67,32 @@ def remember(payload: dict = Body(...)):
     return {"ok": ok, "memory": memory.mem_stats()}
 
 
+@app.post("/api/stamp_preview")
+async def stamp_preview(
+    files: list[UploadFile] = File(...),
+    stamp_image: UploadFile = File(...),
+    ocr: bool = Form(True),
+):
+    """回傳一張「蓋好章的對帳單頁」預覽 PNG（供確認去背與位置）。"""
+    blobs = []
+    for f in files:
+        if not f.filename.lower().endswith(".pdf"):
+            return JSONResponse({"error": "請上傳 PDF 檔：" + f.filename}, status_code=400)
+        blobs.append((f.filename, await f.read()))
+    data = blobs[0][1] if len(blobs) == 1 else builder.merge_sorted(blobs, use_ocr=ocr)[0]
+    chop = await stamp_image.read()
+    try:
+        png = builder.stamp_preview(data, chop, use_ocr=ocr)
+    except Exception as e:  # noqa
+        return JSONResponse({"error": "預覽失敗：{}".format(e)}, status_code=400)
+    if png is None:
+        return JSONResponse({"error": "找不到對帳單頁，無法預覽蓋章"}, status_code=400)
+    return Response(content=png, media_type="image/png")
+
+
 @app.post("/api/build")
 async def build(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     org: str = Form("314"),
     roc_year: str = Form("115"),
     month: str = Form("6"),
@@ -68,21 +101,30 @@ async def build(
     stamp: bool = Form(True),
     add_toc: bool = Form(True),
     page_keys: str = Form(""),
+    stamp_image: UploadFile = File(None),
 ):
-    """產生編碼＋目次的最終 PDF。page_keys 若提供(JSON:[{page,kind,key}...])則以其為準。"""
-    if not file.filename.lower().endswith(".pdf"):
-        return JSONResponse({"error": "請上傳 PDF 檔"}, status_code=400)
-    data = await file.read()
+    """產生編碼＋目次的最終 PDF。多檔時先合併。stamp_image 若提供→對帳單頁右下角蓋章。"""
+    blobs = []
+    for f in files:
+        if not f.filename.lower().endswith(".pdf"):
+            return JSONResponse({"error": "請上傳 PDF 檔：" + f.filename}, status_code=400)
+        blobs.append((f.filename, await f.read()))
     override = None
-    if page_keys:
-        try:
-            override = json.loads(page_keys)
-        except Exception:
-            override = None
+    if len(blobs) == 1:
+        data = blobs[0][1]
+        if page_keys:
+            try:
+                override = json.loads(page_keys)
+            except Exception:
+                override = None
+    else:
+        data, _ = builder.merge_sorted(blobs, use_ocr=ocr)
+    chop_bytes = await stamp_image.read() if stamp_image is not None else None
     try:
         out, summary = builder.build_final(
             data, org=org, roc_year=roc_year, month=month, school=school,
-            use_ocr=ocr, stamp=stamp, add_toc=add_toc, pages_override=override)
+            use_ocr=ocr, stamp=stamp, add_toc=add_toc, pages_override=override,
+            chop_bytes=chop_bytes)
     except Exception as e:  # noqa
         return JSONResponse({"error": "產生失敗：{}".format(e)}, status_code=400)
     fname = "%s年%s月_會計月報.pdf" % (roc_year, month)

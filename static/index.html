@@ -61,9 +61,9 @@
 
   <div class="bar">
     <label class="dz" id="dz">
-      <div class="big" id="fname">＋ 選擇或拖入 PDF</div>
-      <div class="s">整份月報或單張報表皆可</div>
-      <input id="file" type="file" accept="application/pdf" hidden>
+      <div class="big" id="fname">＋ 選擇或拖入 PDF（可多檔）</div>
+      <div class="s">整份月報，或一次拖入多個個別報表（自動依目次順序合併）</div>
+      <input id="file" type="file" accept="application/pdf" multiple hidden>
     </label>
     <label class="ck"><input type="checkbox" id="ocr" checked> 開啟 OCR 辨識掃描頁</label>
     <button class="act" id="go" disabled>開始辨識</button>
@@ -106,6 +106,18 @@
         <label style="display:flex;gap:5px;align-items:center"><input type="checkbox" id="bStamp" checked> 蓋頁碼（第10項起，底部置中）</label>
         <label style="display:flex;gap:5px;align-items:center"><input type="checkbox" id="bToc" checked> 生成目次</label>
       </div>
+      <div style="border-top:1px solid var(--lineSoft);padding-top:10px;margin-bottom:10px">
+        <div style="font-size:12.5px;color:var(--soft);margin-bottom:6px">會計室戳章（選用）：上傳後會自動去白底，蓋在每張<b>對帳單</b>右下角。</div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <label class="dz" id="chopDz" style="flex:0 0 auto;padding:8px 14px;min-width:0">
+            <span id="chopName" style="font-size:13px">＋ 選擇戳章圖（PNG/JPG）</span>
+            <input id="chopInput" type="file" accept="image/*" hidden>
+          </label>
+          <button class="act ghost" id="btnPreview" disabled style="border:1px solid var(--accent);background:#fff;color:var(--accent);padding:8px 14px;border-radius:7px;font-size:13px;cursor:pointer">預覽蓋章</button>
+          <span id="chopStatus" style="font-size:12px;color:var(--soft)"></span>
+        </div>
+        <div id="previewWrap" style="margin-top:10px;display:none"><img id="previewImg" style="max-width:100%;border:1px solid var(--line);border-radius:6px"></div>
+      </div>
       <button class="act" id="btnBuild">產生並下載 PDF</button>
       <span id="buildStatus" style="margin-left:12px;font-size:12.5px;color:var(--accent)"></span>
     </div>
@@ -130,16 +142,24 @@ const ORDER=["i1","i2","i3","ltdebt","i4","i5","i6","i7","i8","i9","i10","bank",
 let pagesData=[];
 
 const dz=document.getElementById("dz"), fileInput=document.getElementById("file");
-let chosen=null;
+let chosenFiles=[];
 dz.addEventListener("click",()=>fileInput.click());
-fileInput.addEventListener("change",e=>setFile(e.target.files[0]));
+fileInput.addEventListener("change",e=>addFiles([...e.target.files]));
 dz.addEventListener("dragover",e=>{e.preventDefault();dz.classList.add("over");});
 dz.addEventListener("dragleave",()=>dz.classList.remove("over"));
 dz.addEventListener("drop",e=>{e.preventDefault();dz.classList.remove("over");
-  const f=[...e.dataTransfer.files].find(x=>x.type==="application/pdf"); if(f)setFile(f);});
-function setFile(f){ if(!f)return; chosen=f;
-  document.getElementById("fname").textContent="📄 "+f.name;
-  document.getElementById("go").disabled=false; }
+  addFiles([...e.dataTransfer.files].filter(x=>x.type==="application/pdf"));});
+function addFiles(fs){
+  fs=(fs||[]).filter(f=>f && f.name.toLowerCase().endsWith(".pdf"));
+  if(!fs.length)return;
+  chosenFiles=chosenFiles.concat(fs);
+  const el=document.getElementById("fname");
+  el.textContent = chosenFiles.length===1 ? "📄 "+chosenFiles[0].name
+    : `📄 已選 ${chosenFiles.length} 個檔（將依目次順序自動合併）`;
+  document.getElementById("go").disabled=false;
+}
+function clearFiles(){ chosenFiles=[]; document.getElementById("fname").textContent="＋ 選擇或拖入 PDF（可多檔）";
+  document.getElementById("go").disabled=true; }
 
 fetch("/api/health").then(r=>r.json()).then(h=>{
   document.getElementById("ocrTag").textContent = h.ocr_available ? "（主機 OCR 可用）" : "（主機未安裝 OCR，開啟無效）";
@@ -157,7 +177,7 @@ function updateOcrHint(){
   document.getElementById("ocrHint").style.display = on ? "block" : "none";
 }
 async function recognize(){
-  if(!chosen)return;
+  if(!chosenFiles.length)return;
   const go=document.getElementById("go");
   const ocrOn=document.getElementById("ocr").checked;
   go.disabled=true;
@@ -173,7 +193,8 @@ async function recognize(){
   const base=st.textContent.replace(/…*$/,"");
   const timer=setInterval(()=>{ dots=(dots+1)%4; st.textContent=base+"．".repeat(dots); },500);
   const fd=new FormData();
-  fd.append("file",chosen); fd.append("ocr",ocrOn); fd.append("thumbnails","true");
+  chosenFiles.forEach(f=>fd.append("files",f));
+  fd.append("ocr",ocrOn); fd.append("thumbnails","true");
   try{
     const r=await fetch("/api/recognize",{method:"POST",body:fd});
     const data=await r.json();
@@ -254,19 +275,44 @@ function setMemCount(n){
   if(el) el.textContent = n>0 ? `已學習 ${n} 筆表頭` : "";
 }
 document.getElementById("btnBuild").addEventListener("click", buildPdf);
+// 戳章上傳與預覽
+let chopFile=null;
+const chopDz=document.getElementById("chopDz"), chopInput=document.getElementById("chopInput");
+chopDz.addEventListener("click",()=>chopInput.click());
+chopInput.addEventListener("change",e=>{ chopFile=e.target.files[0]||null;
+  document.getElementById("chopName").textContent = chopFile? ("🔖 "+chopFile.name) : "＋ 選擇戳章圖（PNG/JPG）";
+  document.getElementById("btnPreview").disabled = !chopFile;
+});
+document.getElementById("btnPreview").addEventListener("click", previewStamp);
+async function previewStamp(){
+  if(!chosenFiles.length || !chopFile) return;
+  const st=document.getElementById("chopStatus"); st.textContent="產生預覽中…";
+  const fd=new FormData();
+  chosenFiles.forEach(f=>fd.append("files",f));
+  fd.append("stamp_image", chopFile);
+  fd.append("ocr", document.getElementById("ocr").checked);
+  try{
+    const r=await fetch("/api/stamp_preview",{method:"POST",body:fd});
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.error||("HTTP "+r.status)); }
+    const blob=await r.blob(); const url=URL.createObjectURL(blob);
+    document.getElementById("previewImg").src=url;
+    document.getElementById("previewWrap").style.display="block";
+    st.textContent="預覽如下（章在對帳單右下角）。去背或位置不滿意可換圖再預覽。";
+  }catch(e){ st.textContent="預覽失敗："+e.message; }
+}
 async function buildPdf(){
-  if(!chosen){ return; }
+  if(!chosenFiles.length){ return; }
   const btn=document.getElementById("btnBuild"), st=document.getElementById("buildStatus");
   btn.disabled=true; st.textContent="產生中，請稍候…";
   const fd=new FormData();
-  fd.append("file", chosen);
+  chosenFiles.forEach(f=>fd.append("files",f));
   fd.append("org", document.getElementById("bOrg").value.trim()||"314");
   fd.append("roc_year", document.getElementById("bYear").value.trim()||"115");
   fd.append("month", document.getElementById("bMonth").value.trim()||"6");
   fd.append("school", document.getElementById("bSchool").value.trim());
   fd.append("stamp", document.getElementById("bStamp").checked);
   fd.append("add_toc", document.getElementById("bToc").checked);
-  // 帶入使用者校正後的逐頁判定，讓成品以校正為準
+  if(chopFile) fd.append("stamp_image", chopFile);
   const pk = pagesData.map(p=>({page:p.page, kind:p.kind, key:p.key}));
   fd.append("page_keys", JSON.stringify(pk));
   try{
