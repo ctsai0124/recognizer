@@ -126,10 +126,25 @@ def _toc_entries(ranges):
     return entries
 
 
+def _toc_font():
+    """目次字型：優先使用者機器上的標楷體(kaiu/DFKai-SB)，否則用隨附開源楷體(UKai)，再退回內建。"""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (r"C:\Windows\Fonts\kaiu.ttf",
+              "/usr/share/fonts/truetype/arphic/ukai.ttc",
+              os.path.join(here, "assets", "ukai.ttc")):
+        if os.path.exists(p):
+            try:
+                return fitz.Font(fontfile=p)
+            except Exception:
+                pass
+    return fitz.Font("china-t")
+
+
 def render_toc(ranges, org, roc_year, month, school):
     """生成目次頁，回傳 fitz.Document（1~多頁）。"""
     entries = _toc_entries(ranges)
-    font = fitz.Font("china-t")           # 內建正體中文字型
+    font = _toc_font()                    # 標楷體
     W, H = 842, 595                       # A4 橫式(landscape)，與實檔一致
     mL, mR = 130, 712                     # 左右邊界（善用橫式寬度）
     top0 = 150                            # 首列 y
@@ -197,25 +212,52 @@ def _clear_old_codes(page, org):
         page.apply_redactions()
 
 
+_CODE_LINE_RE = re.compile(r'^\s*\d+-\d+\s*$')
+
+
+def _visual_rotation(page):
+    """判斷頁面內容的視覺方向(0/90/180/270)。
+    先看可抽取的水平內文量；抽不到(如陽信網銀 Type3 側躺表格)再用 OCR 的 OSD 判方向。"""
+    horiz = 0
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            d = l.get("dir", (1, 0))
+            if abs(d[0]) > 0.7:
+                for s in l["spans"]:
+                    t = s["text"].strip()
+                    if t and not _CODE_LINE_RE.match(t):
+                        horiz += len(t)
+    if horiz >= 40:
+        return 0
+    try:
+        import pytesseract, io
+        from PIL import Image
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        return int(osd.get("rotate", 0)) % 360
+    except Exception:
+        return 0
+
+
 def _stamp(page, text, org, size=11):
-    """蓋頁碼：先清掉殘留舊碼，再依『可視方向』底部置中蓋上。
-    依實檔慣例，直式與橫式的距底留白不同（橫式貼近底邊、直式略高）。
-    帶 /Rotate 的頁面也會落在視覺上的正下方、水平不橫躺。"""
+    """蓋頁碼：先清掉殘留舊碼，再依內容『視覺方向』把碼擺到視覺正下方、且讀向正確不橫躺。
+    - 正立頁：底部置中(直式距底≈30pt、橫式≈8pt)。
+    - 內容側躺的對帳單頁(如陽信網銀匯出)：碼跟著側躺，印在內容的正下方，讀起來仍是『314-頁碼』。"""
     _clear_old_codes(page, org)
-    W, H = page.rect.width, page.rect.height   # page.rect 已含頁面旋轉，為可視尺寸
-    landscape = W > H
-    bottom_margin = 8 if landscape else 30     # 對齊成品：橫式≈6pt、直式≈28pt 距底
-    font = fitz.Font("china-t")
-    w = font.text_length(text, size)
-    tw = fitz.TextWriter(page.rect)
-    tw.append(((W - w) / 2, H - bottom_margin), text, font=font, fontsize=size)
-    rot = page.rotation
-    if rot:
-        page.set_rotation(0)
-        tw.write_text(page)
-        page.set_rotation(rot)
-    else:
-        tw.write_text(page)
+    W, H = page.rect.width, page.rect.height
+    fname = "helv"                         # 頁碼為 ASCII，內建字型即可
+    tl = fitz.get_text_length(text, fontname=fname, fontsize=size)
+    vr = _visual_rotation(page)
+    if vr == 90:                           # 內容需順時針90°轉正 → 碼側躺貼左緣、垂直置中(dir 0,1)
+        page.insert_text((15, (H - tl) / 2), text, fontname=fname, fontsize=size, rotate=270)
+    elif vr == 270:                        # 內容需逆時針90°轉正 → 碼側躺貼右緣(dir 0,-1)
+        page.insert_text((W - 15, (H + tl) / 2), text, fontname=fname, fontsize=size, rotate=90)
+    elif vr == 180:                        # 內容上下顛倒 → 碼倒著印在頁面頂端(即視覺正下方)
+        page.insert_text(((W + tl) / 2, 8 + size), text, fontname=fname, fontsize=size, rotate=180)
+    else:                                  # 正立：底部置中，直/橫式不同距底
+        margin = 8 if W > H else 30
+        page.insert_text(((W - tl) / 2, H - margin), text, fontname=fname, fontsize=size)
 
 
 def prep_stamp(img_bytes, thresh=235):
