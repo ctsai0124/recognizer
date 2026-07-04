@@ -7,6 +7,7 @@
 """
 import fitz
 import io
+import re
 import recognizer as R
 
 # 目次階層（含條件式表；只有實際存在的表才會列出）
@@ -129,12 +130,12 @@ def render_toc(ranges, org, roc_year, month, school):
     """生成目次頁，回傳 fitz.Document（1~多頁）。"""
     entries = _toc_entries(ranges)
     font = fitz.Font("china-t")           # 內建正體中文字型
-    W, H = 595, 842                       # A4 直式
-    mL, mR = 72, 523                      # 左右邊界
-    top0 = 175                            # 首列 y
-    lh = 27                               # 行高
-    bottom = 780
-    per = int((bottom - top0) / lh)
+    W, H = 842, 595                       # A4 橫式(landscape)，與實檔一致
+    mL, mR = 130, 712                     # 左右邊界（善用橫式寬度）
+    top0 = 150                            # 首列 y
+    lh = 26                               # 行高
+    bottom = 548
+    per = max(1, int((bottom - top0) / lh))
 
     doc = fitz.open()
 
@@ -143,9 +144,9 @@ def render_toc(ranges, org, roc_year, month, school):
         def center(text, y, size):
             w = font.text_length(text, size)
             tw.append(((W - w) / 2, y), text, font=font, fontsize=size)
-        center(school, 70, 18)
-        center("目　次", 105, 22)
-        center("中華民國 %s 年 %s 月份" % (roc_year, month), 138, 14)
+        center(school, 60, 18)
+        center("目　次", 92, 22)
+        center("中華民國 %s 年 %s 月份" % (roc_year, month), 122, 14)
         tw.write_text(page)
 
     i = 0
@@ -172,14 +173,49 @@ def render_toc(ranges, org, roc_year, month, school):
     return doc
 
 
-def _stamp(page, text, size=11):
-    """在頁面蓋頁碼：一律底部置中（與實檔一致，直式橫式皆然）。"""
-    W, H = page.rect.width, page.rect.height
+def _clear_old_codes(page, org):
+    """真正移除頁面上任何殘留的『org-數字』頁碼文字（避免重複、或位置不一致的舊碼）。
+    只移除文字層，掃描底圖(影像)保留不動；不塗底色，避免蓋到掃描頁的抬頭。"""
+    pat = re.compile(r'^\s*%s-\d+\s*$' % re.escape(org))
+    try:
+        blocks = page.get_text("dict")["blocks"]
+    except Exception:
+        return
+    rects = []
+    for b in blocks:
+        for l in b.get("lines", []):
+            for s in l["spans"]:
+                if pat.match(s["text"]):
+                    rects.append(fitz.Rect(s["bbox"]))
+    if not rects:
+        return
+    for r in rects:
+        page.add_redact_annot(r, fill=None)     # fill=None：只去文字、不塗色
+    try:
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)  # 不動影像
+    except Exception:
+        page.apply_redactions()
+
+
+def _stamp(page, text, org, size=11):
+    """蓋頁碼：先清掉殘留舊碼，再依『可視方向』底部置中蓋上。
+    依實檔慣例，直式與橫式的距底留白不同（橫式貼近底邊、直式略高）。
+    帶 /Rotate 的頁面也會落在視覺上的正下方、水平不橫躺。"""
+    _clear_old_codes(page, org)
+    W, H = page.rect.width, page.rect.height   # page.rect 已含頁面旋轉，為可視尺寸
+    landscape = W > H
+    bottom_margin = 8 if landscape else 30     # 對齊成品：橫式≈6pt、直式≈28pt 距底
     font = fitz.Font("china-t")
     w = font.text_length(text, size)
     tw = fitz.TextWriter(page.rect)
-    tw.append(((W - w) / 2, H - 20), text, font=font, fontsize=size)
-    tw.write_text(page)
+    tw.append(((W - w) / 2, H - bottom_margin), text, font=font, fontsize=size)
+    rot = page.rotation
+    if rot:
+        page.set_rotation(0)
+        tw.write_text(page)
+        page.set_rotation(rot)
+    else:
+        tw.write_text(page)
 
 
 def prep_stamp(img_bytes, thresh=235):
@@ -279,7 +315,7 @@ def build_final(pdf_bytes, org="314", roc_year="115", month="6",
         out.insert_pdf(src, from_page=p["page"] - 1, to_page=p["page"] - 1)
         idx = body_idx[p["page"]]
         if stamp and stamp_start_idx is not None and idx >= stamp_start_idx:
-            _stamp(out[-1], "%s-%d" % (org, idx))
+            _stamp(out[-1], "%s-%d" % (org, idx), org)
         if chop_png and p.get("key") == "bank":
             overlay_chop(out[-1], chop_png, chop_width_cm, chop_margin_cm)
             bank_stamped += 1
