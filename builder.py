@@ -240,24 +240,23 @@ def _visual_rotation(page):
         return 0
 
 
+def _make_upright(page):
+    """若頁面內容側躺/顛倒(掃描方向不正)，設定頁面旋轉使其『轉正』顯示。回傳套用的旋轉角。"""
+    vr = _visual_rotation(page)
+    if vr:
+        page.set_rotation((page.rotation + vr) % 360)
+    return vr
+
+
 def _stamp(page, text, org, size=11):
-    """蓋頁碼：先清掉殘留舊碼，再依內容『視覺方向』把碼擺到視覺正下方、且讀向正確不橫躺。
-    - 正立頁：底部置中(直式距底≈30pt、橫式≈8pt)。
-    - 內容側躺的對帳單頁(如陽信網銀匯出)：碼跟著側躺，印在內容的正下方，讀起來仍是『314-頁碼』。"""
+    """蓋頁碼：先清掉殘留舊碼，再於(已轉正的)頁面底部置中水平蓋上。
+    直式距底≈30pt、橫式≈8pt，對齊成品慣例。"""
     _clear_old_codes(page, org)
     W, H = page.rect.width, page.rect.height
     fname = "helv"                         # 頁碼為 ASCII，內建字型即可
     tl = fitz.get_text_length(text, fontname=fname, fontsize=size)
-    vr = _visual_rotation(page)
-    if vr == 90:                           # 內容需順時針90°轉正 → 碼側躺貼左緣、垂直置中(dir 0,1)
-        page.insert_text((15, (H - tl) / 2), text, fontname=fname, fontsize=size, rotate=270)
-    elif vr == 270:                        # 內容需逆時針90°轉正 → 碼側躺貼右緣(dir 0,-1)
-        page.insert_text((W - 15, (H + tl) / 2), text, fontname=fname, fontsize=size, rotate=90)
-    elif vr == 180:                        # 內容上下顛倒 → 碼倒著印在頁面頂端(即視覺正下方)
-        page.insert_text(((W + tl) / 2, 8 + size), text, fontname=fname, fontsize=size, rotate=180)
-    else:                                  # 正立：底部置中，直/橫式不同距底
-        margin = 8 if W > H else 30
-        page.insert_text(((W - tl) / 2, H - margin), text, fontname=fname, fontsize=size)
+    margin = 8 if W > H else 30
+    page.insert_text(((W - tl) / 2, H - margin), text, fontname=fname, fontsize=size)
 
 
 def prep_stamp(img_bytes, thresh=235):
@@ -350,16 +349,32 @@ def build_final(pdf_bytes, org="314", roc_year="115", month="6",
         out.insert_pdf(toc)
         toc.close()
 
-    # 3) 正文（保留原頁），第 code_from 項起蓋碼；對帳單頁右下角蓋章
+    # 3) 正文：第 code_from 項起，側躺掃描頁「烘正」成正立頁(rotation=0)，再水平蓋碼、右下角蓋章
     bank_stamped = 0
     body_pages = [p for p in pages if p["kind"] != "front"]
     for p in body_pages:
-        out.insert_pdf(src, from_page=p["page"] - 1, to_page=p["page"] - 1)
+        pno = p["page"] - 1
         idx = body_idx[p["page"]]
-        if stamp and stamp_start_idx is not None and idx >= stamp_start_idx:
-            _stamp(out[-1], "%s-%d" % (org, idx), org)
+        in_region = stamp_start_idx is not None and idx >= stamp_start_idx
+        rot = _visual_rotation(src[pno]) if in_region else 0
+        if rot:                                    # 側躺 → 清舊碼(原方向)後烘正成正立頁
+            tmp = fitz.open()
+            tmp.insert_pdf(src, from_page=pno, to_page=pno)
+            _clear_old_codes(tmp[0], org)
+            r = tmp[0].rect
+            if rot in (90, 270):
+                pg = out.new_page(width=r.height, height=r.width)
+            else:
+                pg = out.new_page(width=r.width, height=r.height)
+            pg.show_pdf_page(pg.rect, tmp, 0, rotate=(360 - rot) % 360)
+            tmp.close()
+        else:
+            out.insert_pdf(src, from_page=pno, to_page=pno)
+            pg = out[-1]
+        if stamp and in_region:
+            _stamp(pg, "%s-%d" % (org, idx), org)
         if chop_png and p.get("key") == "bank":
-            overlay_chop(out[-1], chop_png, chop_width_cm, chop_margin_cm)
+            overlay_chop(pg, chop_png, chop_width_cm, chop_margin_cm)
             bank_stamped += 1
 
     data = out.tobytes(deflate=True)
